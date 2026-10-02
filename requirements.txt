@@ -1,0 +1,149 @@
+import cv2
+import numpy as np
+import serial
+import time
+from collections import deque
+
+SERIAL_PORT = "COM3"       # Windows example
+# SERIAL_PORT = "/dev/ttyUSB0"  # Linux / Raspberry Pi
+BAUD_RATE = 9600
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+COLOR_RANGES = {
+    "RED": [
+        (np.array([0, 90, 70]), np.array([10, 255, 255])),
+        (np.array([170, 90, 70]), np.array([180, 255, 255]))
+    ],
+    "GREEN": [(np.array([35, 60, 40]), np.array([90, 255, 255]))],
+    "BLUE": [(np.array([100, 80, 50]), np.array([130, 255, 255]))],
+}
+
+class VisionSorter:
+    def __init__(self, port):
+        self.serial_port = serial.Serial(port, BAUD_RATE, timeout=1)
+        time.sleep(2)
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(3, FRAME_WIDTH)
+        self.cap.set(4, FRAME_HEIGHT)
+        self.last_label = None
+        self.last_send_time = 0
+        self.history = deque(maxlen=6)
+
+    def send_command(self, command):
+        if self.serial_port.is_open:
+            self.serial_port.write((command + "\n").encode("utf-8"))
+            self.serial_port.flush()
+            print(f"Sent: {command}")
+
+    def detect_best_object(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        best = None
+
+        for label, ranges in COLOR_RANGES.items():
+            combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+
+            for lower, upper in ranges:
+                mask = cv2.inRange(hsv, lower, upper)
+                combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+            kernel = np.ones((5, 5), np.uint8)
+            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                continue
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 600:
+                    continue
+
+                x, y, w, h = cv2.boundingRect(contour)
+                rect_area = w * h
+                if rect_area <= 0:
+                    continue
+
+                score = area / rect_area
+                if best is None or score > best["score"]:
+                    best = {
+                        "label": label,
+                        "score": score,
+                        "contour": contour,
+                        "bbox": (x, y, w, h),
+                        "area": area,
+                    }
+
+        return best
+
+    def draw_result(self, frame, result):
+        if result is None:
+            cv2.putText(frame, "NO OBJECT", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            return
+
+        x, y, w, h = result["bbox"]
+        label = result["label"]
+
+        color_map = {
+            "RED": (0, 0, 255),
+            "GREEN": (0, 255, 0),
+            "BLUE": (255, 0, 0),
+        }
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color_map.get(label, (255, 255, 255)), 2)
+        cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_map.get(label, (255, 255, 255)), 2)
+        cv2.putText(frame, f"Area: {result['area']}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    def stable_label(self, label):
+        self.history.append(label)
+        if len(self.history) < self.history.maxlen:
+            return None
+
+        most_common = max(set(self.history), key=self.history.count)
+        if self.history.count(most_common) >= 4:
+            return most_common
+        return None
+
+    def run(self):
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Camera read failed")
+                break
+
+            result = self.detect_best_object(frame)
+            label = result["label"] if result else None
+
+            if label is not None:
+                stable = self.stable_label(label)
+                if stable and stable != self.last_label:
+                    self.last_label = stable
+                    self.send_command(f"SORT:{stable}")
+                    self.last_send_time = time.time()
+            else:
+                self.last_label = None
+                self.history.clear()
+
+            self.draw_result(frame, result)
+            cv2.imshow("AI Object Sorter", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            if key == ord('s'):
+                self.send_command("STATUS")
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+        self.serial_port.close()
+
+
+def main():
+    sorter = VisionSorter(SERIAL_PORT)
+    sorter.run()
+
+
+if __name__ == "__main__":
+    main()
